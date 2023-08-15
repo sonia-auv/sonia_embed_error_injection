@@ -1,4 +1,6 @@
 #include "TeensyTimerTool.h"
+#include "hamming_toolkit.h"
+#include <cmath>
 using namespace TeensyTimerTool;
 
 static volatile bool send_client_side_to_host = false;
@@ -34,16 +36,10 @@ static volatile uint32_t targeted_rs485_id = 0xFF;
 
 
 void (*end_of_frame_callback)(void) = NULL;
-
-//#define CAN_INITIAL_DELAY (43040ns)
-//4912
-//#define CAN_INITIAL_DELAY (2949ns)
 #define CAN_INITIAL_DELAY (2800ns)
-
-//9824ns
 #define CAN_DELAY (8138ns)
-//#define CAN_DELAY (86081ns)
 
+//pin definition
 #define INTERFACE_ID 0
 #define KILL_SWITCH_ID 8
 
@@ -68,25 +64,26 @@ void (*end_of_frame_callback)(void) = NULL;
 #define RS485_RECEIVER_EN_CLIENT 17
 #define RS485_TERM_EN_CLIENT 18
 
+//rs485 protocol definition
 #define RS485_START_BYTE 0x55
-
 #define BAUDRATE_RS485 115200
 
+//timer for can sampling
 OneShotTimer t1(GPT1);
 OneShotTimer t2(GPT2);
 
-
 typedef enum{
-  SYNC,
-  ID,
-  SIZE,
-  DATA
-} state_rs485_receive_t;
+  HEADER_HAMMING,
+  DATA_HAMMING
+} state_rs485_receive_hamming_t;
+
 
 
 static void sample_callback(void);
 static void can_start_of_frame_detecte_handle(void);
 void setup() {
+
+  //pin setup
   pinMode(CAN_BUS_RX_HOST_SIDE, INPUT);
   pinMode(CAN_BUS_TX_HOST_SIDE, OUTPUT);
   pinMode(CAN_BUS_RX_CLIENT_SIDE, INPUT);
@@ -102,24 +99,26 @@ void setup() {
   pinMode(RS485_RECEIVER_EN_CLIENT, OUTPUT);
   pinMode(RS485_TERM_EN_CLIENT, OUTPUT);
 
-
+  //rs485 setup
   RS485_CLIENT.begin(BAUDRATE_RS485);
   RS485_CLIENT.transmitterEnable(RS485_DRIVER_EN_CLIENT);
   RS485_HOST.begin(BAUDRATE_RS485);
   RS485_HOST.transmitterEnable(RS485_DRIVER_EN_HOST);
-
   digitalWrite(RS485_TERM_EN_HOST,1);
   digitalWrite(RS485_RECEIVER_EN_HOST,0);
-
   digitalWrite(RS485_TERM_EN_CLIENT,1);
   digitalWrite(RS485_RECEIVER_EN_CLIENT,0);
 
   pinMode(0,OUTPUT);
+
+  //can receive attach interupt
   attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE), can_start_of_frame_detecte_handle, FALLING );
   attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE), can_start_of_frame_detecte_handle, FALLING );
   
   t1.begin(sample_callback);
   Serial.begin(9600);
+
+  //out rx in rececive state
   digitalWrite(CAN_BUS_TX_HOST_SIDE,1);
   digitalWrite(CAN_BUS_TX_CLIENT_SIDE,1);
   digitalWrite(LED_PIN,0);
@@ -133,8 +132,8 @@ void setup() {
 
 
 void loop() {
-  // put your main code here, to run repeatedly:
 
+  //print information from the decoded CAN frame
   if(frame_done == 1)
   {
     frame_done =0;
@@ -151,6 +150,7 @@ void loop() {
 
   }
 
+  //listen for id of the messages to corrupt
   if(Serial.available() > 0)
   {
       int dataIn = Serial.parseInt();
@@ -174,19 +174,17 @@ void loop() {
 
   }
 
+  //print information about CAN bus corruption
   if(notify_fault_injected)
   {
     notify_fault_injected = false;
     printf("    ->Fault injected for ARBID %ld\r\n", targeted_arbid);
   }
-
-
   if(notify_fault_detected)
   {
     notify_fault_detected = false;
     printf("    ->Fault detected by the receiving MCU\r\n");
   }
-
   if(notify_fault_corrected)
   {
     notify_fault_corrected = false;
@@ -194,23 +192,30 @@ void loop() {
   }
 
 
-  /*if( RS485_HOST.available() != 0)
-  {
-  }*/
-  handle_rs485();
-  //delay(500);
+  handle_rs485_hamming();
 }
 
-
-void handle_rs485(void)
+//decode and transfert 485 messagea, posibly inject error
+void handle_rs485_hamming(void)
 {
-  static state_rs485_receive_t current_state = SYNC;
+  static state_rs485_receive_hamming_t current_state = HEADER_HAMMING;
   static bool rs485_client_is_receiver = true;
   static uint32_t msg_size =0;
   static uint32_t current_data_index = 0;
   static uint8_t current_id = 0;
+  static size_t current_header_position=0;
   uint8_t byte_to_send;
-  
+
+  const size_t HEADER_DECODED_SIZE = 3;
+  const size_t HEADER_ENCODED_SIZE = 2*HEADER_DECODED_SIZE;
+  const size_t HEADER_ENCODED_PACK_SIZE = (size_t) ceil(((double)HEADER_ENCODED_SIZE*7)/8);
+
+  static uint8_t pack_header[HEADER_ENCODED_PACK_SIZE] = {0};
+  static uint8_t unpack_header[HEADER_ENCODED_SIZE] = {0};
+  static uint8_t deinterleaved_header[HEADER_ENCODED_SIZE] = {0};
+  static uint8_t decoded_header[HEADER_DECODED_SIZE] = {0};
+
+
   int dataAvaliable = (rs485_client_is_receiver)?  RS485_HOST.available():RS485_CLIENT.available()  ;
   if(dataAvaliable)
   {
@@ -218,57 +223,85 @@ void handle_rs485(void)
      
     uint8_t byte =  (rs485_client_is_receiver)?  RS485_HOST.read():RS485_CLIENT.read();
 
-    if(targeted_rs485_id == current_id && current_state == DATA)
+    //corrupt message if need be
+    if(targeted_rs485_id == current_id && current_state == DATA_HAMMING && current_data_index == 0)
     {
-      byte_to_send = byte ^ 0b100;
+      printf("Injecting error\n");
+      byte_to_send = byte ^ 0b1100;
     }
     else
     {
       byte_to_send = byte;
     }
 
+    //transfert data to the other side
     if(rs485_client_is_receiver){
       RS485_CLIENT.write(byte_to_send);
     }else{
       RS485_HOST.write(byte_to_send);
     }
 
+    //state machine to decode RS485 protocole
     switch(current_state){
-      case SYNC:
+      case HEADER_HAMMING:
         printf("STATE SYNC\n");
-        current_state = (byte==RS485_START_BYTE)?ID:SYNC;
-      break;
 
-      case ID:
-        printf("STATE ID\n");
-        current_id = byte;
-        current_state = SIZE;
-      break;
-
-      case SIZE:
-        printf("STATE SIZE\n");
-        msg_size = byte;
-        current_data_index=0;
-
-        if(msg_size != 0)
+        pack_header[current_header_position] = byte;
+        current_header_position++;
+        
+        //once the header is fully received, decode it
+        if(current_header_position == HEADER_ENCODED_PACK_SIZE)
         {
-          current_state = DATA;
-        }
-        else
-        {
-          rs485_client_is_receiver = !rs485_client_is_receiver;
-          current_state = SYNC;
+          HammingToolkit::unpack_7_bits_values(pack_header, HEADER_ENCODED_PACK_SIZE, unpack_header, HEADER_ENCODED_SIZE);
+          HammingToolkit::deinterleaving_post_depack(deinterleaved_header, HEADER_ENCODED_SIZE, unpack_header);
+          HammingToolkit::decode_hamming_74_message(deinterleaved_header, HEADER_ENCODED_SIZE, decoded_header, HEADER_DECODED_SIZE);
+
+          current_data_index = 0;
+          current_header_position = 0;
+
+          current_id = decoded_header[1];
+
+          //compute message size of the encoded message
+          msg_size = (uint32_t) ceil(((double)decoded_header[2]*2*7)/8);
+          printf("current_id:%u (targeted_rs485_id: %u)\n",current_id, targeted_rs485_id);
+          printf("msg size = %d (%d)\n",msg_size,HEADER_ENCODED_PACK_SIZE);
+
+          if(msg_size != 0)
+          {
+            current_state = DATA_HAMMING;
+          }
+          else
+          {
+            //is msg_size is 0, return back to wait for header
+            rs485_client_is_receiver = !rs485_client_is_receiver;
+            current_state = HEADER_HAMMING;
+          }
+
+          if(targeted_rs485_id == current_id)
+            printf("id\n");
+
+          if(current_state == DATA_HAMMING)
+            printf("state\n");
+
+          if(current_data_index == 0)
+            printf("index\n");
+
+
+          if(targeted_rs485_id == current_id && current_state == DATA_HAMMING && current_data_index == 0)
+          {
+            printf("ok\n");
+          }
         }
       break;
 
-      case DATA:
+      case DATA_HAMMING:
         printf("STATE DATA\n");
         current_data_index++;
 
         if(current_data_index == msg_size)
         {
           rs485_client_is_receiver = !rs485_client_is_receiver;
-          current_state = SYNC;
+          current_state = HEADER_HAMMING;
           printf("going back to sync\n");
         }
 
@@ -284,12 +317,15 @@ void handle_rs485(void)
 
 }
 
+
+
 //This function get called by the interupt on the RX pin to detect
 //the start of the CAN frame, this then start the timer to sample
 //the whole frame
 static void can_start_of_frame_detecte_handle(void)
 {
 
+    //reset values for can sampling
     arbid = 0;
     can_rx_crc = 0;
     msg_byte = 0;
@@ -301,21 +337,13 @@ static void can_start_of_frame_detecte_handle(void)
     send_to_receiver(1,client_is_receiver);
 
     t1.trigger(CAN_INITIAL_DELAY);
-    //digitalWriteFast(CAN_BUS_TX_CLIENT_SIDE,digitalReadFast(CAN_BUS_RX_HOST_SIDE));
-
-    //digitalWriteFast(0, !digitalReadFast(0));    /* Check to see if this is a stuff bit */
     detachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE));
     detachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE));
 
-    /*if(client_is_receiver){
-      detachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE));
-    }else{
-      detachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE));
-    }*/
 }
 
 
-
+//functions to send/read depending on who is the emmiter/receiver
 static void send_to_emmiter(int bit_sent, bool client_is_receiver)
 {
   if(client_is_receiver){
@@ -363,15 +391,6 @@ static void exit_error_state(void)
   send_to_emmiter(1,client_is_receiver);
   attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE), can_start_of_frame_detecte_handle, FALLING );
   attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE), can_start_of_frame_detecte_handle, FALLING );
-
-  /*if(client_is_receiver)
-  {
-    attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE), can_start_of_frame_detecte_handle, FALLING );
-  }
-  else
-  {
-    attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE), can_start_of_frame_detecte_handle, FALLING );
-  }*/
 }
 
 static void enter_error_state(void)
@@ -388,6 +407,10 @@ static void enter_error_state(void)
   }
 }
 
+
+
+//version modifié du code de bitbane (https://github.com/bitbane/CANT)
+//sous licence BSD
 /* Interrupt callback for sampling a CAN message. Uses the 
  * following global variables
  *
@@ -410,6 +433,7 @@ static void sample_callback(void)
     bool currently_in_error_state = false;
     bit_read = read_emmiter(client_is_receiver);
 
+    //bit corruption
     if(!corrupt_next_bit)
     {
       send_to_receiver(bit_read,client_is_receiver);
@@ -419,7 +443,6 @@ static void sample_callback(void)
       current_message_corrupted = false;
     }
 
-    //digitalWriteFast(CAN_BUS_TX_CLIENT_SIDE,bit_read);
 
     /* Check to see if this is a stuff bit */
     if (same_bits_count >= 5) /* This is a stuff bit or an error frame */
@@ -513,11 +536,7 @@ static void sample_callback(void)
             {
                 can_rx_crc <<= 1;
                 can_rx_crc |= bit_read;
-                if(bits_read < (34 + (8 * msg_len)-1))
-                {
-                  //corrupt_next_bit = true;
-                  //corruption_armed = false;
-                }
+
                 if(bits_read == (34 + (8 * msg_len))) // Last bit of the CRC
                 {
                     /* There is no bit stuffing for the CRC delimiter, ACK slot, or ACK delimiter */
@@ -529,18 +548,12 @@ static void sample_callback(void)
             }
             else if(bits_read == (36 + (8 * msg_len))) // This is the ACK slot
             {
-              //send_to_receiver(0,client_is_receiver);
               send_to_emmiter(0,client_is_receiver);
-
-              //digitalWriteFast(CAN_BUS_TX_HOST_SIDE, 0);
-              //digitalWriteFast(CAN_BUS_TX_CLIENT_SIDE,0);
             }
              else if(bits_read == (37 + (8 * msg_len))) // This is the ACK Delimiter
              {
               send_to_receiver(1,client_is_receiver);
               send_to_emmiter(1,client_is_receiver);
-                //digitalWriteFast(CAN_BUS_TX_HOST_SIDE, 1);
-                //digitalWriteFast(CAN_BUS_TX_CLIENT_SIDE,1);
              }
             else if((bits_read >= (38 + (8 * msg_len))) && (bits_read < (45 + (8 * msg_len)))) // End Of Frame bits
             {
@@ -614,36 +627,30 @@ static void sample_callback(void)
     if((extended_arbid == 0 && bits_read >= (48 + (8 * msg_len))) ||
        (extended_arbid == 1 && bits_read >= (40 + 18 + (8 * msg_len))))
     {
-        // Enable the external interrupt on the RX pin
-
+        //end of the CAN frame, setup for next frame
         same_bits_count = 0;
         bits_read = 0;
         last_bit = 0;
-        //digitalWriteFast(0, !digitalReadFast(0));    /* Check to see if this is a stuff bit */
         if(!currently_in_error_state)
         {
           frame_done = 1;
           frames_seen++;
+          //wait for a new receive
           attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE), can_start_of_frame_detecte_handle, FALLING );
           attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE), can_start_of_frame_detecte_handle, FALLING );
 
+          //switch who is the receiver
           if(client_is_receiver){
-
             if(arbid == KILL_SWITCH_ID && !current_message_corrupted){
-              //attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE), can_start_of_frame_detecte_handle, FALLING );
               client_is_receiver = false;
             }else{
-              //attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE), can_start_of_frame_detecte_handle, FALLING );
               client_is_receiver = true;
             }
 
           }else{
-
             if(arbid == INTERFACE_ID && !current_message_corrupted){
-              //attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_HOST_SIDE), can_start_of_frame_detecte_handle, FALLING );
               client_is_receiver = true;
             }else{
-              //attachInterrupt(digitalPinToInterrupt(CAN_BUS_RX_CLIENT_SIDE), can_start_of_frame_detecte_handle, FALLING );
               client_is_receiver = false;
             }
           }
@@ -656,9 +663,9 @@ static void sample_callback(void)
     }
     else
     {
+      //frame is not ended, schedule next sample 
       t1.trigger(CAN_DELAY);
     }
-    //digitalWriteFast(0, !digitalReadFast(0));    /* Check to see if this is a stuff bit */
 }
 
 
